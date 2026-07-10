@@ -148,7 +148,8 @@ func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
 				reading_time,
 				changed_at,
 				document_vectors,
-				tags
+				tags,
+				language
 			)
 		SELECT
 			$1,
@@ -163,7 +164,8 @@ func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
 			$10,
 			now(),
 			setweight(to_tsvector($11), 'A') || setweight(to_tsvector($12), 'B'),
-			$13
+			$13,
+			$14
 		WHERE NOT EXISTS (
 			SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
 		)
@@ -185,6 +187,7 @@ func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
 		truncatedTitle,
 		truncatedContent,
 		pq.Array(entry.Tags),
+		entry.Language,
 	).Scan(
 		&entry.ID,
 		&entry.Status,
@@ -226,7 +229,8 @@ func (s *Storage) updateEntry(tx *sql.Tx, entry *model.Entry) error {
 			author=$5,
 			reading_time=$6,
 			document_vectors = setweight(to_tsvector($7), 'A') || setweight(to_tsvector($8), 'B'),
-			tags=$12
+			tags=$12,
+			language=$13
 		WHERE
 			user_id=$9 AND feed_id=$10 AND hash=$11
 		RETURNING
@@ -246,6 +250,7 @@ func (s *Storage) updateEntry(tx *sql.Tx, entry *model.Entry) error {
 		entry.FeedID,
 		entry.Hash,
 		pq.Array(entry.Tags),
+		entry.Language,
 	).Scan(&entry.ID)
 	if err != nil {
 		return fmt.Errorf(`store: unable to update entry %q: %v`, entry.URL, err)
@@ -501,18 +506,8 @@ func (s *Storage) SetEntriesStatusAndCountVisible(userID int64, entryIDs []int64
 // SetEntriesStarredState updates the starred state for the given list of entries.
 func (s *Storage) SetEntriesStarredState(userID int64, entryIDs []int64, starred bool) error {
 	query := `UPDATE entries SET starred=$1, changed_at=now() WHERE user_id=$2 AND id=ANY($3)`
-	result, err := s.db.Exec(query, starred, userID, pq.Array(entryIDs))
-	if err != nil {
+	if _, err := s.db.Exec(query, starred, userID, pq.Array(entryIDs)); err != nil {
 		return fmt.Errorf(`store: unable to update the starred state %v: %v`, entryIDs, err)
-	}
-
-	count, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf(`store: unable to update these entries %v: %v`, entryIDs, err)
-	}
-
-	if count == 0 {
-		return errors.New(`store: nothing has been updated`)
 	}
 
 	return nil
@@ -598,7 +593,9 @@ func (s *Storage) MarkAllAsReadBeforeDate(userID int64, before time.Time) error 
 	return nil
 }
 
-// MarkGloballyVisibleFeedsAsRead updates all user entries to the read status.
+// MarkGloballyVisibleFeedsAsRead marks as read the unread entries that are
+// visible in the global unread view, i.e. those belonging to a feed and a
+// category that are both not hidden globally.
 func (s *Storage) MarkGloballyVisibleFeedsAsRead(userID int64) error {
 	query := `
 		UPDATE
@@ -608,13 +605,15 @@ func (s *Storage) MarkGloballyVisibleFeedsAsRead(userID int64) error {
 			changed_at=now()
 		FROM
 			feeds
+			JOIN categories ON (categories.id = feeds.category_id)
 		WHERE
 			entries.feed_id = feeds.id
 			AND entries.user_id=$2
 			AND entries.status=$3
-			AND feeds.hide_globally=$4
+			AND feeds.hide_globally IS FALSE
+			AND categories.hide_globally IS FALSE
 	`
-	result, err := s.db.Exec(query, model.EntryStatusRead, userID, model.EntryStatusUnread, false)
+	result, err := s.db.Exec(query, model.EntryStatusRead, userID, model.EntryStatusUnread)
 	if err != nil {
 		return fmt.Errorf(`store: unable to mark globally visible feeds as read: %v`, err)
 	}
